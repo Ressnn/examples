@@ -24,6 +24,7 @@ from composer.utils import dist, reproducibility
 from omegaconf import DictConfig
 from omegaconf import OmegaConf as om
 
+from pytorch_optimizer import load_optimizer
 
 def update_batch_size_info(cfg: DictConfig):
     global_batch_size, device_microbatch_size = cfg.global_train_batch_size, cfg.device_train_microbatch_size
@@ -125,6 +126,24 @@ def build_optimizer(cfg, model):
                               betas=cfg.betas,
                               eps=cfg.eps,
                               weight_decay=cfg.weight_decay)
+      
+    if cfg.name == 'soap':
+        return create_optimizer(
+                  model.parameters(),
+                  'soap',
+                  lr=cfg.lr,
+                  betas=cfg.betas,
+                  weight_decay=cfg.weight_decay,
+              )
+      
+    if cfg.name == 'grokkfast':
+        return create_optimizer(
+                  model.parameters(),
+                  'grokfastadamw',
+                  lr=cfg.lr,
+                  betas=cfg.betas,
+                  weight_decay=cfg.weight_decay,
+              )
     else:
         raise ValueError(f'Not sure how to build optimizer: {cfg.name}')
 
