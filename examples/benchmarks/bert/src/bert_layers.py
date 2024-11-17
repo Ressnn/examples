@@ -147,7 +147,7 @@ class BertEmbeddings(nn.Module):
         return embeddings
 
 
-class BertUnpadSelfAttention(nn.Module):
+class BertUnpadSelfAttentionOld(nn.Module):
     """Performs multi-headed self attention on a batch of unpadded sequences.
 
     If Triton is installed, this module uses Flash Attention to greatly improve throughput.
@@ -245,6 +245,149 @@ class BertUnpadSelfAttention(nn.Module):
             attention,
             torch.squeeze(attn_mask) == 1)
         return rearrange(attention, 'nnz h d -> nnz (h d)')
+
+class BertUnpadSelfAttention(nn.Module):
+    """Performs multi-headed self attention on a batch of unpadded sequences (Using Differential Self-Attention Layers).
+
+    If Triton is installed, this module uses Flash Attention to greatly improve throughput.
+    The Flash Attention implementation used in Mosaic BERT supports arbitrary attention biases (which
+    we use to implement ALiBi), but does not support attention dropout. If either Triton is not installed
+    or `config.attention_probs_dropout_prob > 0`, the implementation will default to a
+    math-equivalent pytorch version, which is much slower.
+
+    See `forward` method for additional detail.
+    """
+
+    def __init__(self, config, use_differential_attention=False, layer_index=1):
+        super().__init__()
+        if config.hidden_size % config.num_attention_heads != 0 and not hasattr(
+                config, 'embedding_size'):
+            raise ValueError(
+                f'The hidden size ({config.hidden_size}) is not a multiple of the number of attention '
+                f'heads ({config.num_attention_heads})')
+
+        self.num_attention_heads = config.num_attention_heads
+        self.attention_head_size = int(config.hidden_size /
+                                       config.num_attention_heads)
+        self.all_head_size = self.num_attention_heads * self.attention_head_size
+        self.dropout = nn.Dropout(config.attention_probs_dropout_prob)
+        self.p_dropout = config.attention_probs_dropout_prob
+        self.use_differential_attention = use_differential_attention
+
+        if self.use_differential_attention:
+            # Adjust Wqkv to output projections for Q1, K1, Q2, K2, and V
+            self.Wqkv = nn.Linear(self.all_head_size, 5 * config.hidden_size)
+            # Initialize λ based on layer index
+            lambda_init = 0.8 - 0.6 * math.exp(-0.3 * (layer_index - 1))
+            self.lambda_ = nn.Parameter(torch.tensor(lambda_init))
+        else:
+            # Standard Wqkv for regular attention
+            self.Wqkv = nn.Linear(self.all_head_size, 3 * config.hidden_size)
+
+        # Warn if defaulting to PyTorch because of import issues
+        if flash_attn_qkvpacked_func is None:
+            warnings.warn(
+                'Unable to import Triton; defaulting attention implementation to PyTorch (this will reduce throughput).'
+            )
+
+    def forward(self, hidden_states: torch.Tensor, cu_seqlens: torch.Tensor,
+                max_seqlen_in_batch: int, indices: torch.Tensor,
+                attn_mask: torch.Tensor, bias: torch.Tensor) -> torch.Tensor:
+        """Perform self-attention or differential attention."""
+        if self.use_differential_attention:
+            batch_size = cu_seqlens.shape[0] - 1
+            hidden_size = hidden_states.size(-1)
+            # Compute combined projections for Q1, K1, Q2, K2, and V
+            qkv = self.Wqkv(hidden_states)  # (total_nnz, 5 * hidden_size)
+            # Pad input
+            qkv = bert_padding_module.pad_input(
+                qkv, indices, batch_size,
+                max_seqlen_in_batch)  # (batch_size, max_seq_len, 5 * hidden_size)
+            # Rearrange to (batch_size, seq_len, 5, num_heads, head_dim)
+            qkv = rearrange(qkv,
+                            'b s (t h d) -> b s t h d',
+                            t=5,
+                            h=self.num_attention_heads)
+            # Split into Q1, K1, V and Q2, K2, V
+            qkv1 = qkv[:, :, :3, :, :]  # Q1, K1, V
+            qkv2 = torch.cat([qkv[:, :, 3:5, :, :], qkv[:, :, 2:3, :, :]], dim=2)  # Q2, K2, V
+
+            if self.p_dropout == 0 and flash_attn_qkvpacked_func is not None:
+                # Use Flash Attention
+                attention1 = flash_attn_qkvpacked_func(qkv1, bias)
+                attention2 = flash_attn_qkvpacked_func(qkv2, bias)
+                attention = attention1 - self.lambda_ * attention2
+            else:
+                # PyTorch implementation
+                # Compute attention1
+                q1 = qkv1[:, :, 0, :, :].permute(0, 2, 1, 3)  # (batch_size, num_heads, seq_len, head_dim)
+                k1 = qkv1[:, :, 1, :, :].permute(0, 2, 3, 1)  # (batch_size, num_heads, head_dim, seq_len)
+                v = qkv1[:, :, 2, :, :].permute(0, 2, 1, 3)   # V is shared
+                s = 1 / math.sqrt(self.attention_head_size)
+                attention_scores1 = torch.matmul(q1, k1) * s
+                attention_scores1 = attention_scores1 + bias
+                attention_probs1 = nn.functional.softmax(attention_scores1, dim=-1)
+
+                # Compute attention2
+                q2 = qkv2[:, :, 0, :, :].permute(0, 2, 1, 3)
+                k2 = qkv2[:, :, 1, :, :].permute(0, 2, 3, 1)
+                attention_scores2 = torch.matmul(q2, k2) * s
+                attention_scores2 = attention_scores2 + bias
+                attention_probs2 = nn.functional.softmax(attention_scores2, dim=-1)
+
+                # Differential attention probabilities
+                attention_probs = attention_probs1 - self.lambda_ * attention_probs2
+                attention_probs = self.dropout(attention_probs)
+
+                # Compute attention output
+                attention = torch.matmul(attention_probs, v).permute(0, 2, 1, 3)  # (batch_size, seq_len, num_heads, head_dim)
+
+            # Unpad the attention output
+            attention = bert_padding_module.unpad_input_only(
+                attention,
+                torch.squeeze(attn_mask) == 1)
+            return rearrange(attention, 'nnz h d -> nnz (h d)')
+        else:
+            # Standard attention implementation
+            qkv = self.Wqkv(hidden_states)
+            qkv = bert_padding_module.pad_input(
+                qkv, indices, cu_seqlens.shape[0] - 1,
+                max_seqlen_in_batch)  # (batch_size, max_seq_len, 3 * hidden_size)
+            qkv = rearrange(qkv,
+                            'b s (t h d) -> b s t h d',
+                            t=3,
+                            h=self.num_attention_heads)
+            if self.p_dropout or flash_attn_qkvpacked_func is None:
+                # PyTorch implementation
+                q = qkv[:, :, 0, :, :].permute(0, 2, 1, 3)
+                k = qkv[:, :, 1, :, :].permute(0, 2, 3, 1)
+                v = qkv[:, :, 2, :, :].permute(0, 2, 1, 3)
+                attention_scores = torch.matmul(q, k) / math.sqrt(
+                    self.attention_head_size)
+                attention_scores = attention_scores + bias
+                attention_probs = nn.functional.softmax(attention_scores, dim=-1)
+                attention_probs = self.dropout(attention_probs)
+                attention = torch.matmul(attention_probs, v).permute(0, 2, 1,
+                                                                     3)
+            else:
+                # Flash Attention implementation
+                convert_dtype = qkv.dtype not in [torch.float16, torch.bfloat16]
+                if convert_dtype:
+                    orig_dtype = qkv.dtype
+                    qkv = qkv.to(torch.float16)
+                    bias_dtype = bias.dtype
+                    bias = bias.to(torch.float16)
+                    attention = flash_attn_qkvpacked_func(qkv, bias)
+                    attention = attention.to(orig_dtype)
+                    bias = bias.to(bias_dtype)
+                else:
+                    attention = flash_attn_qkvpacked_func(qkv, bias)
+
+            # Unpad the attention output
+            attention = bert_padding_module.unpad_input_only(
+                attention,
+                torch.squeeze(attn_mask) == 1)
+            return rearrange(attention, 'nnz h d -> nnz (h d)')
 
 
 # Copy of transformer's library BertSelfOutput that will not be caught by surgery methods looking for HF BERT modules.
