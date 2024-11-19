@@ -61,7 +61,7 @@ scheduler:
   alpha_f: 0.02 # Linearly decay to 0.02x the full LR by the end of the training duration
 
 optimizer:
-  name: soap
+  name: grokkfast
   lr: 5.0e-4 # Peak learning rate
   betas:
   - 0.9
