@@ -24,7 +24,7 @@ from composer.utils import dist, reproducibility
 from omegaconf import DictConfig
 from omegaconf import OmegaConf as om
 
-from pytorch_optimizer import load_optimizer
+from grokfast import GrokAdamW
 
 def update_batch_size_info(cfg: DictConfig):
     global_batch_size, device_microbatch_size = cfg.global_train_batch_size, cfg.device_train_microbatch_size
@@ -137,11 +137,11 @@ def build_optimizer(cfg, model):
               )
       
     if cfg.name == 'grokkfast':
-        return create_optimizer(
+        return GrokAdamW(
                   model.parameters(),
-                  'grokfastadamw',
                   lr=cfg.lr,
                   betas=cfg.betas,
+                  eps=cfg.eps,
                   weight_decay=cfg.weight_decay,
               )
     else:
