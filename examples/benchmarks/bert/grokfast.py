@@ -3,10 +3,6 @@ import torch
 from torch.optim import Optimizer
 from torch.cuda.amp import autocast
 from typing import Iterable, Callable, Optional
-import logging
-
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
 
 class GrokAdamW(Optimizer):
     def __init__(self, params: Iterable[torch.Tensor], lr: float = 1e-3, betas: tuple[float, float] = (0.9, 0.999),
@@ -80,7 +76,7 @@ class GrokAdamW(Optimizer):
                 if signal is not None:
                     signals.append(signal)
             except Exception as e:
-                logger.warning(f"Error in grokking_signal_fn: {e}. Ignoring this function.")
+                print(f"Error in grokking_signal_fn: {e}. Ignoring this function.")
         
         return sum(signals) / len(signals) if signals else None
 
