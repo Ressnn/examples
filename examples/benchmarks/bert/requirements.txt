@@ -6,4 +6,3 @@ omegaconf==2.2.3
 transformers==4.28.1
 # need a newer version of triton
 triton==2.1.0
-logging
