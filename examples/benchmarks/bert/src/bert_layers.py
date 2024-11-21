@@ -1,9 +1,12 @@
 # Copyright 2022 MosaicML Examples authors
 # SPDX-License-Identifier: Apache-2.0
 
+# Copyright 2023 MosaicML Examples authors
+# SPDX-License-Identifier: Apache-2.0
+
 # Copyright 2018 The Google AI Language Team Authors and The HuggingFace Inc. team.
 # Copyright (c) 2018-2021, NVIDIA CORPORATION.  All rights reserved.
-# Copyright (c) 2022, Tri Dao.
+# Copyright (c) 2023, Tri Dao.
 
 """Implements Mosaic BERT, with an eye towards the Hugging Face API.
 
@@ -16,20 +19,20 @@ of training with shorter sequence lengths by enabling extrapolation to longer se
 2. Gated Linear Units (GLU). This architectural change replaces the FFN component of the BERT layer
 to improve overall expressiveness, providing better convergence properties.
 
-3. Flash Attention. The Mosaic BERT's self-attention layer makes use of Flash Attention, which dramatically
+3. Flash Attention. The MosaicBERT's self-attention layer makes use of Flash Attention, which dramatically
 improves the speed of self-attention. Our implementation utilizes a bleeding edge implementation that
 supports attention biases, which allows us to use Flash Attention with ALiBi.
 
 4. Unpadding. Padding is often used to simplify batching across sequences of different lengths. Standard BERT
-implementations waste computation on padded tokens. Mosaic BERT internally unpads to reduce unnecessary computation
+implementations waste computation on padded tokens. MosaicBERT internally unpads to reduce unnecessary computation
 and improve speed. It does this without changing how the user interfaces with the model, thereby
 preserving the simple API of standard implementations.
 
 
-Currently, Mosaic BERT is available for masked language modeling :class:`BertForMaskedLM` and sequence
+Currently, MosaicBERT is available for masked language modeling :class:`BertForMaskedLM` and sequence
 classification :class:`BertForSequenceClassification`. We aim to expand this catalogue in future releases.
 
-See :file:`./mosaic_bert.py` for utilities to simplify working with Mosaic BERT in Composer, and for example usage
+See :file:`./mosaic_bert.py` for utilities to simplify working with MosaicBERT in Composer, and for example usage
 of the core Mosaic BERT classes.
 """
 
@@ -39,10 +42,13 @@ import math
 import os
 import sys
 import warnings
+from functools import lru_cache
 from typing import List, Optional, Tuple, Union
 
 # Add folder root to path to allow us to use relative imports regardless of what directory the script is run from
 sys.path.append(os.path.dirname(os.path.realpath(__file__)))
+
+import importlib
 
 import bert_padding as bert_padding_module
 import torch
@@ -54,13 +60,35 @@ from transformers.modeling_outputs import (MaskedLMOutput,
                                            SequenceClassifierOutput)
 from transformers.models.bert.modeling_bert import BertPreTrainedModel
 
+IMPL_USE_FLASH2 = False
+# Import Flash Attention 2, which supports ALiBi https://github.com/Dao-AILab/flash-attention
 try:
-    import flash_attn_triton as flash_attn_triton
-    flash_attn_qkvpacked_func = flash_attn_triton.flash_attn_qkvpacked_func
+    from flash_attn import flash_attn_qkvpacked_func  # type: ignore
+    installed_version = importlib.metadata.version('flash_attn')  # type: ignore
+    if installed_version < '2.4.2':
+        raise ImportError('newer version of flash_attn required (>= 2.4.2)')
+    IMPL_USE_FLASH2 = True
 except ImportError as e:
-    flash_attn_qkvpacked_func = None
+    warnings.warn(
+        f'Failed to import flash_attn. Will try to import triton implementation: {e}',
+        stacklevel=2)
+    # Import custom Triton Flash Attention implementation that supports ALiBi
+    try:
+        import flash_attn_triton as flash_attn_triton
+        flash_attn_qkvpacked_func = flash_attn_triton.flash_attn_qkvpacked_func
+    except ImportError as e:
+        flash_attn_qkvpacked_func = None
+        warnings.warn(f'Failed to import flash_attn_triton as a fallback: {e}',
+                      stacklevel=2)
 
 logger = logging.getLogger(__name__)
+
+
+@lru_cache
+def _get_half_dtype() -> torch.dtype:
+    if torch.cuda.is_bf16_supported():
+        return torch.bfloat16
+    return torch.float16
 
 
 class BertEmbeddings(nn.Module):
@@ -147,13 +175,13 @@ class BertEmbeddings(nn.Module):
         return embeddings
 
 
-class BertUnpadSelfAttentionOld(nn.Module):
+class BertUnpadSelfAttention(nn.Module):
     """Performs multi-headed self attention on a batch of unpadded sequences.
 
-    If Triton is installed, this module uses Flash Attention to greatly improve throughput.
-    The Flash Attention implementation used in Mosaic BERT supports arbitrary attention biases (which
-    we use to implement ALiBi), but does not support attention dropout. If either Triton is not installed
-    or `config.attention_probs_dropout_prob > 0`, the implementation will default to a
+    If Flash Attention 2 is installed, this module uses Flash Attention to greatly improve throughput.
+    The Flash Attention implementation used in MosaicBERT supports arbitrary attention biases (which
+    we use to implement ALiBi), but does not support attention dropout. If either Flash Attention 2 is
+    not installed or `config.attention_probs_dropout_prob > 0`, the implementation will default to a
     math-equivalent pytorch version, which is much slower.
 
     See `forward` method for additional detail.
@@ -183,16 +211,18 @@ class BertUnpadSelfAttentionOld(nn.Module):
 
     def forward(self, hidden_states: torch.Tensor, cu_seqlens: torch.Tensor,
                 max_seqlen_in_batch: int, indices: torch.Tensor,
-                attn_mask: torch.Tensor, bias: torch.Tensor) -> torch.Tensor:
+                attn_mask: torch.Tensor, bias: torch.Tensor,
+                slopes: torch.Tensor) -> torch.Tensor:
         """Perform self-attention.
 
-        If dropout is zero, then we can use the Triton kernel, so we do that. However, if not, we send through a standard PyTorch
-        implementation of self-attention.
+        There are three attention implementations supported: vanilla attention with ALiBi,
+        Triton Flash Attention with ALibi, and Flash Attention 2 with ALiBi
+
+        In order to use the Triton kernel, dropout must be zero (i.e. attention_probs_dropout_prob = 0)
 
         The arguments are unpadded, and our implementations of attention require padded arguments,
         so we first call `pad_input`. Once we compute attention, we re-unpad our outputs for the other layers.
         The pad/unpad operations add overhead, but not sending pad tokens through ffs saves compute.
-        It is possible to write an unpadded implementation of attention (in Triton and PyTorch), which we will eventually do.
 
         Args:
             hidden_states: (total_nnz, dim)
@@ -201,6 +231,7 @@ class BertUnpadSelfAttentionOld(nn.Module):
             indices: (total_nnz,)
             attn_mask: (batch, max_seqlen_in_batch)
             bias: (batch, heads, max_seqlen_in_batch, max_seqlen_in_batch)
+            slopes: (heads) or (batch, heads)
 
         Returns:
             attention: (total_nnz, dim)
@@ -213,7 +244,10 @@ class BertUnpadSelfAttentionOld(nn.Module):
                         'b s (t h d) -> b s t h d',
                         t=3,
                         h=self.num_attention_heads)
-        if self.p_dropout or flash_attn_qkvpacked_func is None:
+
+        # Option 1: Vanilla Self Attention with ALiBi
+        if (not IMPL_USE_FLASH2 and
+                self.p_dropout) or flash_attn_qkvpacked_func is None:
             # if we have nonzero attention dropout (e.g. during fine-tuning) or no Triton, compute attention in PyTorch
             q = qkv[:, :, 0, :, :].permute(0, 2, 1, 3)  # b h s d
             k = qkv[:, :, 1, :, :].permute(0, 2, 3, 1)  # b h d s
@@ -226,168 +260,58 @@ class BertUnpadSelfAttentionOld(nn.Module):
             attention = torch.matmul(attention_probs, v).permute(0, 2, 1,
                                                                  3)  # b s h d
         else:
-            # Triton implementation only supports 0 attention dropout
-            convert_dtype = qkv.dtype not in [torch.float16, torch.bfloat16]
-            if convert_dtype:
-                # Triton implementation only supports fp16 and bf16
-                orig_dtype = qkv.dtype
-                qkv = qkv.to(torch.float16)
-                bias_dtype = bias.dtype
-                bias = bias.to(torch.float16)
-                attention = flash_attn_qkvpacked_func(qkv, bias)
-                attention = attention.to(orig_dtype)
-                bias = bias.to(bias_dtype)
-            else:
-                attention = flash_attn_qkvpacked_func(qkv, bias)
+            # Option 2: Flash Attention 2 with ALiBi
+            if IMPL_USE_FLASH2:
+                assert 1 <= len(slopes.shape) <= 2, f'{slopes=}'
+                assert slopes.shape[
+                    -1] == self.num_attention_heads, f'{slopes=}'
 
-        # attn_mask is 1 for attend and 0 for don't
-        attention = bert_padding_module.unpad_input_only(
-            attention,
-            torch.squeeze(attn_mask) == 1)
-        return rearrange(attention, 'nnz h d -> nnz (h d)')
-
-class BertUnpadSelfAttention(nn.Module):
-    """Performs multi-headed self attention on a batch of unpadded sequences (Using Differential Self-Attention Layers).
-
-    If Triton is installed, this module uses Flash Attention to greatly improve throughput.
-    The Flash Attention implementation used in Mosaic BERT supports arbitrary attention biases (which
-    we use to implement ALiBi), but does not support attention dropout. If either Triton is not installed
-    or `config.attention_probs_dropout_prob > 0`, the implementation will default to a
-    math-equivalent pytorch version, which is much slower.
-
-    See `forward` method for additional detail.
-    """
-
-    def __init__(self, config, use_differential_attention=False, layer_index=1):
-        super().__init__()
-        if config.hidden_size % config.num_attention_heads != 0 and not hasattr(
-                config, 'embedding_size'):
-            raise ValueError(
-                f'The hidden size ({config.hidden_size}) is not a multiple of the number of attention '
-                f'heads ({config.num_attention_heads})')
-
-        self.num_attention_heads = config.num_attention_heads
-        self.attention_head_size = int(config.hidden_size /
-                                       config.num_attention_heads)
-        self.all_head_size = self.num_attention_heads * self.attention_head_size
-        self.dropout = nn.Dropout(config.attention_probs_dropout_prob)
-        self.p_dropout = config.attention_probs_dropout_prob
-        self.use_differential_attention = use_differential_attention
-
-        if self.use_differential_attention:
-            # Adjust Wqkv to output projections for Q1, K1, Q2, K2, and V
-            self.Wqkv = nn.Linear(self.all_head_size, 5 * config.hidden_size)
-            # Initialize λ based on layer index
-            lambda_init = 0.8 - 0.6 * math.exp(-0.3 * (layer_index - 1))
-            self.lambda_ = nn.Parameter(torch.tensor(lambda_init))
-        else:
-            # Standard Wqkv for regular attention
-            self.Wqkv = nn.Linear(self.all_head_size, 3 * config.hidden_size)
-
-        # Warn if defaulting to PyTorch because of import issues
-        if flash_attn_qkvpacked_func is None:
-            warnings.warn(
-                'Unable to import Triton; defaulting attention implementation to PyTorch (this will reduce throughput).'
-            )
-
-    def forward(self, hidden_states: torch.Tensor, cu_seqlens: torch.Tensor,
-                max_seqlen_in_batch: int, indices: torch.Tensor,
-                attn_mask: torch.Tensor, bias: torch.Tensor) -> torch.Tensor:
-        """Perform self-attention or differential attention."""
-        if self.use_differential_attention:
-            batch_size = cu_seqlens.shape[0] - 1
-            hidden_size = hidden_states.size(-1)
-            # Compute combined projections for Q1, K1, Q2, K2, and V
-            qkv = self.Wqkv(hidden_states)  # (total_nnz, 5 * hidden_size)
-            # Pad input
-            qkv = bert_padding_module.pad_input(
-                qkv, indices, batch_size,
-                max_seqlen_in_batch)  # (batch_size, max_seq_len, 5 * hidden_size)
-            # Rearrange to (batch_size, seq_len, 5, num_heads, head_dim)
-            qkv = rearrange(qkv,
-                            'b s (t h d) -> b s t h d',
-                            t=5,
-                            h=self.num_attention_heads)
-            # Split into Q1, K1, V and Q2, K2, V
-            qkv1 = qkv[:, :, :3, :, :]  # Q1, K1, V
-            qkv2 = torch.cat([qkv[:, :, 3:5, :, :], qkv[:, :, 2:3, :, :]], dim=2)  # Q2, K2, V
-
-            if self.p_dropout == 0 and flash_attn_qkvpacked_func is not None:
-                # Use Flash Attention
-                attention1 = flash_attn_qkvpacked_func(qkv1, bias)
-                attention2 = flash_attn_qkvpacked_func(qkv2, bias)
-                attention = attention1 - self.lambda_ * attention2
-            else:
-                # PyTorch implementation
-                # Compute attention1
-                q1 = qkv1[:, :, 0, :, :].permute(0, 2, 1, 3)  # (batch_size, num_heads, seq_len, head_dim)
-                k1 = qkv1[:, :, 1, :, :].permute(0, 2, 3, 1)  # (batch_size, num_heads, head_dim, seq_len)
-                v = qkv1[:, :, 2, :, :].permute(0, 2, 1, 3)   # V is shared
-                s = 1 / math.sqrt(self.attention_head_size)
-                attention_scores1 = torch.matmul(q1, k1) * s
-                attention_scores1 = attention_scores1 + bias
-                attention_probs1 = nn.functional.softmax(attention_scores1, dim=-1)
-
-                # Compute attention2
-                q2 = qkv2[:, :, 0, :, :].permute(0, 2, 1, 3)
-                k2 = qkv2[:, :, 1, :, :].permute(0, 2, 3, 1)
-                attention_scores2 = torch.matmul(q2, k2) * s
-                attention_scores2 = attention_scores2 + bias
-                attention_probs2 = nn.functional.softmax(attention_scores2, dim=-1)
-
-                # Differential attention probabilities
-                attention_probs = attention_probs1 - self.lambda_ * attention_probs2
-                attention_probs = self.dropout(attention_probs)
-
-                # Compute attention output
-                attention = torch.matmul(attention_probs, v).permute(0, 2, 1, 3)  # (batch_size, seq_len, num_heads, head_dim)
-
-            # Unpad the attention output
-            attention = bert_padding_module.unpad_input_only(
-                attention,
-                torch.squeeze(attn_mask) == 1)
-            return rearrange(attention, 'nnz h d -> nnz (h d)')
-        else:
-            # Standard attention implementation
-            qkv = self.Wqkv(hidden_states)
-            qkv = bert_padding_module.pad_input(
-                qkv, indices, cu_seqlens.shape[0] - 1,
-                max_seqlen_in_batch)  # (batch_size, max_seq_len, 3 * hidden_size)
-            qkv = rearrange(qkv,
-                            'b s (t h d) -> b s t h d',
-                            t=3,
-                            h=self.num_attention_heads)
-            if self.p_dropout or flash_attn_qkvpacked_func is None:
-                # PyTorch implementation
-                q = qkv[:, :, 0, :, :].permute(0, 2, 1, 3)
-                k = qkv[:, :, 1, :, :].permute(0, 2, 3, 1)
-                v = qkv[:, :, 2, :, :].permute(0, 2, 1, 3)
-                attention_scores = torch.matmul(q, k) / math.sqrt(
-                    self.attention_head_size)
-                attention_scores = attention_scores + bias
-                attention_probs = nn.functional.softmax(attention_scores, dim=-1)
-                attention_probs = self.dropout(attention_probs)
-                attention = torch.matmul(attention_probs, v).permute(0, 2, 1,
-                                                                     3)
-            else:
-                # Flash Attention implementation
-                convert_dtype = qkv.dtype not in [torch.float16, torch.bfloat16]
+                convert_dtype = qkv.dtype not in (torch.float16, torch.bfloat16)
                 if convert_dtype:
+                    # FA2 implementation only supports fp16 and bf16
+                    # If FA2 is supported, bfloat16 must be supported
+                    # as of FA2 2.4.2. (Turing GPUs not supported)
                     orig_dtype = qkv.dtype
-                    qkv = qkv.to(torch.float16)
+                    qkv = qkv.to(torch.bfloat16)
                     bias_dtype = bias.dtype
-                    bias = bias.to(torch.float16)
+                    bias = bias.to(torch.bfloat16)
+
+                    attention = flash_attn_qkvpacked_func(
+                        qkv, dropout_p=self.p_dropout, alibi_slopes=slopes)
+                    attention = attention.to(orig_dtype)  # type: ignore
+                    bias = bias.to(bias_dtype)
+                else:
+                    attention = flash_attn_qkvpacked_func(
+                        qkv, dropout_p=self.p_dropout, alibi_slopes=slopes)
+            # Option 3: Triton Implementation of Flash Attention with ALiBi
+            else:
+                # Triton implementation only supports 0 attention dropout
+                if self.p_dropout > 0.0:
+                    raise ValueError(
+                        f'dropout probability of the attention layer is ({self.p_dropout} '
+                        f'the Triton kernel for Flash Attention requires attention_probs_dropout_prob=0'
+                    )
+
+                convert_dtype = qkv.dtype not in (torch.float16, torch.bfloat16)
+                if convert_dtype:
+                    half = _get_half_dtype()
+
+                    # Triton implementation only supports fp16 and bf16
+                    orig_dtype = qkv.dtype
+                    qkv = qkv.to(half)
+                    bias_dtype = bias.dtype
+                    bias = bias.to(half)
                     attention = flash_attn_qkvpacked_func(qkv, bias)
-                    attention = attention.to(orig_dtype)
+                    attention = attention.to(orig_dtype)  # type: ignore
                     bias = bias.to(bias_dtype)
                 else:
                     attention = flash_attn_qkvpacked_func(qkv, bias)
 
-            # Unpad the attention output
-            attention = bert_padding_module.unpad_input_only(
-                attention,
-                torch.squeeze(attn_mask) == 1)
-            return rearrange(attention, 'nnz h d -> nnz (h d)')
+        # attn_mask is 1 for attend and 0 for don't attend
+        attention = bert_padding_module.unpad_input_only(
+            attention,  # type: ignore
+            torch.squeeze(attn_mask) == 1)
+        return rearrange(attention, 'nnz h d -> nnz (h d)')
 
 
 # Copy of transformer's library BertSelfOutput that will not be caught by surgery methods looking for HF BERT modules.
@@ -434,6 +358,7 @@ class BertUnpadAttention(nn.Module):
         indices: Optional[torch.Tensor] = None,
         attn_mask: Optional[torch.Tensor] = None,
         bias: Optional[torch.Tensor] = None,
+        slopes: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Forward pass for scaled self-attention without padding.
 
@@ -446,9 +371,11 @@ class BertUnpadAttention(nn.Module):
             indices: None or (total_nnz,)
             attn_mask: None or (batch, max_seqlen_in_batch)
             bias: None or (batch, heads, max_seqlen_in_batch, max_seqlen_in_batch)
+            slopes: None or (batch, heads) or (heads,)
         """
+        assert (bias is None) == (slopes is None), f'{bias=}, {slopes=}'
         self_output = self.self(input_tensor, cu_seqlens, max_s, indices,
-                                attn_mask, bias)
+                                attn_mask, bias, slopes)
         if subset_idx is not None:
             return self.output(
                 bert_padding_module.index_first_axis(self_output, subset_idx),
@@ -522,6 +449,7 @@ class BertLayer(nn.Module):
         indices: Optional[torch.Tensor] = None,
         attn_mask: Optional[torch.Tensor] = None,
         bias: Optional[torch.Tensor] = None,
+        slopes: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Forward pass for a BERT layer, including both attention and MLP.
 
@@ -534,9 +462,12 @@ class BertLayer(nn.Module):
             indices: None or (total_nnz,)
             attn_mask: None or (batch, max_seqlen_in_batch)
             bias: None or (batch, heads, max_seqlen_in_batch, max_seqlen_in_batch)
+            slopes: None or (batch, heads) or (heads,)
         """
+        assert (bias is None) == (slopes is None), f'{bias=}, {slopes=}'
         attention_output = self.attention(hidden_states, cu_seqlens, seqlen,
-                                          subset_idx, indices, attn_mask, bias)
+                                          subset_idx, indices, attn_mask, bias,
+                                          slopes)
         layer_output = self.mlp(attention_output)
         return layer_output
 
@@ -606,6 +537,7 @@ class BertEncoder(nn.Module):
         relative_position = relative_position.unsqueeze(0).expand(
             n_heads, -1, -1)
         slopes = torch.Tensor(_get_alibi_head_slopes(n_heads)).to(device)
+        self.slopes = slopes
         alibi = slopes.unsqueeze(1).unsqueeze(1) * -relative_position
         # [1, n_heads, max_token_length, max_token_length]
         alibi = alibi.unsqueeze(0)
@@ -647,6 +579,7 @@ class BertEncoder(nn.Module):
         elif self.alibi.device != hidden_states.device:
             # Device catch-up
             self.alibi = self.alibi.to(hidden_states.device)
+            self.slopes = self.slopes.to(hidden_states.device)  # type: ignore
         alibi_bias = self.alibi[:, :, :seqlen, :seqlen]
         attn_bias = extended_attention_mask[:, :, :seqlen, :seqlen]
         alibi_attn_mask = attn_bias + alibi_bias
@@ -660,7 +593,8 @@ class BertEncoder(nn.Module):
                                              None,
                                              indices,
                                              attn_mask=attention_mask,
-                                             bias=alibi_attn_mask)
+                                             bias=alibi_attn_mask,
+                                             slopes=self.slopes)
                 if output_all_encoded_layers:
                     all_encoder_layers.append(hidden_states)
             # Pad inputs and mask. It will insert back zero-padded tokens.
@@ -679,7 +613,8 @@ class BertEncoder(nn.Module):
                                              None,
                                              indices,
                                              attn_mask=attention_mask,
-                                             bias=alibi_attn_mask)
+                                             bias=alibi_attn_mask,
+                                             slopes=self.slopes)
                 if output_all_encoded_layers:
                     all_encoder_layers.append(hidden_states)
             subset_idx = torch.nonzero(subset_mask[attention_mask_bool],
@@ -690,7 +625,8 @@ class BertEncoder(nn.Module):
                                            subset_idx=subset_idx,
                                            indices=indices,
                                            attn_mask=attention_mask,
-                                           bias=alibi_attn_mask)
+                                           bias=alibi_attn_mask,
+                                           slopes=self.slopes)
 
         if not output_all_encoded_layers:
             all_encoder_layers.append(hidden_states)
