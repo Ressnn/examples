@@ -176,13 +176,13 @@ class BertEmbeddings(nn.Module):
 
 
 class BertUnpadSelfAttention(nn.Module):
-    """Performs multi-headed self attention on a batch of unpadded sequences.
+    """Performs multi-headed self-attention with differential attention on a batch of unpadded sequences.
 
-    If Flash Attention 2 is installed, this module uses Flash Attention to greatly improve throughput.
-    The Flash Attention implementation used in MosaicBERT supports arbitrary attention biases (which
-    we use to implement ALiBi), but does not support attention dropout. If either Flash Attention 2 is
-    not installed or `config.attention_probs_dropout_prob > 0`, the implementation will default to a
-    math-equivalent pytorch version, which is much slower.
+    If Flash Attention 2 is installed, this module uses it to greatly improve throughput.
+    The Flash Attention implementation supports arbitrary attention biases (used to implement ALiBi)
+    but does not support attention dropout. If either Flash Attention 2 is not installed or
+    `config.attention_probs_dropout_prob > 0`, the implementation will default to a math-equivalent
+    PyTorch version, which is much slower.
 
     See `forward` method for additional detail.
     """
@@ -201,28 +201,32 @@ class BertUnpadSelfAttention(nn.Module):
         self.all_head_size = self.num_attention_heads * self.attention_head_size
         self.dropout = nn.Dropout(config.attention_probs_dropout_prob)
         self.p_dropout = config.attention_probs_dropout_prob
-        self.Wqkv = nn.Linear(self.all_head_size, 3 * config.hidden_size)
 
-        # Warn if defaulting to pytorch because of import issues
+        # Adjust Wqkv to output projections for Q1, K1, Q2, K2, and V
+        self.Wqkv = nn.Linear(self.all_head_size, 5 * config.hidden_size)
+        # Initialize λ to 0.8
+        self.lambda_ = nn.Parameter(torch.tensor(0.8))
+
+        # Warn if defaulting to PyTorch because of import issues
         if flash_attn_qkvpacked_func is None:
             warnings.warn(
-                'Unable to import Triton; defaulting MosaicBERT attention implementation to pytorch (this will reduce throughput when using this model).'
+                'Unable to import Triton; defaulting MosaicBERT attention implementation to PyTorch (this will reduce throughput when using this model).'
             )
 
     def forward(self, hidden_states: torch.Tensor, cu_seqlens: torch.Tensor,
                 max_seqlen_in_batch: int, indices: torch.Tensor,
                 attn_mask: torch.Tensor, bias: torch.Tensor,
                 slopes: torch.Tensor) -> torch.Tensor:
-        """Perform self-attention.
+        """Perform differential self-attention.
 
         There are three attention implementations supported: vanilla attention with ALiBi,
-        Triton Flash Attention with ALibi, and Flash Attention 2 with ALiBi
+        Triton Flash Attention with ALiBi, and Flash Attention 2 with ALiBi.
 
-        In order to use the Triton kernel, dropout must be zero (i.e. attention_probs_dropout_prob = 0)
+        In order to use the Triton kernel, dropout must be zero (i.e., attention_probs_dropout_prob = 0).
 
         The arguments are unpadded, and our implementations of attention require padded arguments,
         so we first call `pad_input`. Once we compute attention, we re-unpad our outputs for the other layers.
-        The pad/unpad operations add overhead, but not sending pad tokens through ffs saves compute.
+        The pad/unpad operations add overhead, but not sending pad tokens through FFNs saves compute.
 
         Args:
             hidden_states: (total_nnz, dim)
@@ -236,29 +240,44 @@ class BertUnpadSelfAttention(nn.Module):
         Returns:
             attention: (total_nnz, dim)
         """
+        # Compute combined projections for Q1, K1, Q2, K2, and V
         qkv = self.Wqkv(hidden_states)
         qkv = bert_padding_module.pad_input(
             qkv, indices, cu_seqlens.shape[0] - 1,
-            max_seqlen_in_batch)  # batch, max_seqlen_in_batch, thd
+            max_seqlen_in_batch)  # (batch_size, max_seq_len, 5 * hidden_size)
+        # Rearrange to (batch_size, seq_len, 5, num_heads, head_dim)
         qkv = rearrange(qkv,
                         'b s (t h d) -> b s t h d',
-                        t=3,
+                        t=5,
                         h=self.num_attention_heads)
 
-        # Option 1: Vanilla Self Attention with ALiBi
-        if (not IMPL_USE_FLASH2 and
-                self.p_dropout) or flash_attn_qkvpacked_func is None:
-            # if we have nonzero attention dropout (e.g. during fine-tuning) or no Triton, compute attention in PyTorch
-            q = qkv[:, :, 0, :, :].permute(0, 2, 1, 3)  # b h s d
-            k = qkv[:, :, 1, :, :].permute(0, 2, 3, 1)  # b h d s
-            v = qkv[:, :, 2, :, :].permute(0, 2, 1, 3)  # b h s d
-            attention_scores = torch.matmul(q, k) / math.sqrt(
-                self.attention_head_size)
-            attention_scores = attention_scores + bias
-            attention_probs = nn.functional.softmax(attention_scores, dim=-1)
+        # Option 1: Vanilla Self-Attention with ALiBi (PyTorch implementation)
+        if (not IMPL_USE_FLASH2 and self.p_dropout) or flash_attn_qkvpacked_func is None:
+            # Extract Q1, K1, Q2, K2, V
+            Q1 = qkv[:, :, 0, :, :].permute(0, 2, 1, 3)  # (batch_size, num_heads, seq_len, head_dim)
+            K1 = qkv[:, :, 1, :, :].permute(0, 2, 3, 1)  # (batch_size, num_heads, head_dim, seq_len)
+            Q2 = qkv[:, :, 2, :, :].permute(0, 2, 1, 3)
+            K2 = qkv[:, :, 3, :, :].permute(0, 2, 3, 1)
+            V = qkv[:, :, 4, :, :].permute(0, 2, 1, 3)   # (batch_size, num_heads, seq_len, head_dim)
+
+            # Compute attention scores
+            s = 1 / math.sqrt(self.attention_head_size)
+            A1 = torch.matmul(Q1, K1) * s
+            A1 = A1 + bias
+            A2 = torch.matmul(Q2, K2) * s
+            A2 = A2 + bias
+
+            # Apply softmax
+            P1 = nn.functional.softmax(A1, dim=-1)
+            P2 = nn.functional.softmax(A2, dim=-1)
+
+            # Compute differential attention probabilities
+            attention_probs = P1 - self.lambda_ * P2
             attention_probs = self.dropout(attention_probs)
-            attention = torch.matmul(attention_probs, v).permute(0, 2, 1,
-                                                                 3)  # b s h d
+
+            # Multiply with V
+            attention = torch.matmul(attention_probs, V)  # (batch_size, num_heads, seq_len, head_dim)
+            attention = attention.permute(0, 2, 1, 3)  # (batch_size, seq_len, num_heads, head_dim)
         else:
             # Option 2: Flash Attention 2 with ALiBi
             if IMPL_USE_FLASH2:
@@ -266,53 +285,48 @@ class BertUnpadSelfAttention(nn.Module):
                 assert slopes.shape[
                     -1] == self.num_attention_heads, f'{slopes=}'
 
+                # Prepare qkv1 and qkv2
+                qkv1 = torch.stack([qkv[:, :, 0, :, :], qkv[:, :, 1, :, :], qkv[:, :, 4, :, :]], dim=2)  # Q1, K1, V
+                qkv2 = torch.stack([qkv[:, :, 2, :, :], qkv[:, :, 3, :, :], qkv[:, :, 4, :, :]], dim=2)  # Q2, K2, V
+
                 convert_dtype = qkv.dtype not in (torch.float16, torch.bfloat16)
                 if convert_dtype:
                     # FA2 implementation only supports fp16 and bf16
-                    # If FA2 is supported, bfloat16 must be supported
-                    # as of FA2 2.4.2. (Turing GPUs not supported)
-                    orig_dtype = qkv.dtype
-                    qkv = qkv.to(torch.bfloat16)
+                    orig_dtype = qkv1.dtype
+                    qkv1 = qkv1.to(torch.bfloat16)
+                    qkv2 = qkv2.to(torch.bfloat16)
                     bias_dtype = bias.dtype
                     bias = bias.to(torch.bfloat16)
 
-                    attention = flash_attn_qkvpacked_func(
-                        qkv, dropout_p=self.p_dropout, alibi_slopes=slopes)
-                    attention = attention.to(orig_dtype)  # type: ignore
+                    # Compute attention1 and attention2
+                    attention1 = flash_attn_qkvpacked_func(
+                        qkv1, dropout_p=self.p_dropout, alibi_slopes=slopes)
+                    attention2 = flash_attn_qkvpacked_func(
+                        qkv2, dropout_p=self.p_dropout, alibi_slopes=slopes)
+
+                    attention1 = attention1.to(orig_dtype)  # type: ignore
+                    attention2 = attention2.to(orig_dtype)  # type: ignore
                     bias = bias.to(bias_dtype)
                 else:
-                    attention = flash_attn_qkvpacked_func(
-                        qkv, dropout_p=self.p_dropout, alibi_slopes=slopes)
+                    # Compute attention1 and attention2
+                    attention1 = flash_attn_qkvpacked_func(
+                        qkv1, dropout_p=self.p_dropout, alibi_slopes=slopes)
+                    attention2 = flash_attn_qkvpacked_func(
+                        qkv2, dropout_p=self.p_dropout, alibi_slopes=slopes)
+
+                # Compute differential attention output
+                attention = attention1 - self.lambda_ * attention2
+
             # Option 3: Triton Implementation of Flash Attention with ALiBi
             else:
-                # Triton implementation only supports 0 attention dropout
-                if self.p_dropout > 0.0:
-                    raise ValueError(
-                        f'dropout probability of the attention layer is ({self.p_dropout} '
-                        f'the Triton kernel for Flash Attention requires attention_probs_dropout_prob=0'
-                    )
+                # Triton implementation may not support differential attention directly
+                raise NotImplementedError("Differential attention with Triton implementation is not supported.")
 
-                convert_dtype = qkv.dtype not in (torch.float16, torch.bfloat16)
-                if convert_dtype:
-                    half = _get_half_dtype()
-
-                    # Triton implementation only supports fp16 and bf16
-                    orig_dtype = qkv.dtype
-                    qkv = qkv.to(half)
-                    bias_dtype = bias.dtype
-                    bias = bias.to(half)
-                    attention = flash_attn_qkvpacked_func(qkv, bias)
-                    attention = attention.to(orig_dtype)  # type: ignore
-                    bias = bias.to(bias_dtype)
-                else:
-                    attention = flash_attn_qkvpacked_func(qkv, bias)
-
-        # attn_mask is 1 for attend and 0 for don't attend
+        # Unpad the attention output
         attention = bert_padding_module.unpad_input_only(
             attention,  # type: ignore
             torch.squeeze(attn_mask) == 1)
         return rearrange(attention, 'nnz h d -> nnz (h d)')
-
 
 # Copy of transformer's library BertSelfOutput that will not be caught by surgery methods looking for HF BERT modules.
 class BertSelfOutput(nn.Module):
