@@ -5,7 +5,7 @@
 # Or point data paths to your remote C4 dataset
 # Small config to validate
 data_local: 
-data_remote: s3://finewebdataset/fine-web/
+data_remote: s3://finewebdataset/
 
 max_seq_len: 256
 tokenizer_name: bert-base-uncased
